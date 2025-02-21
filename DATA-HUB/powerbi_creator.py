@@ -1,110 +1,186 @@
+import msal
 import requests
+import json
 import pandas as pd
+import time
 import sys
 sys.path.append(r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project")
 import config
 
-# 🔹 Microsoft Fabric (Power BI) Credentials
+# 🔹 Microsoft Fabric Credentials
 CLIENT_ID = config.client_id
 CLIENT_SECRET = config.client_secret
 TENANT_ID = config.tenant_id
-WORKSPACE_ID =
-EXCEL_FILE = 
-DATASET_NAME = 
+WORKSPACE_ID = 
 
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPE = ["https://graph.microsoft.com/.default"]
+SCOPE = ["https://api.fabric.microsoft.com/.default"]
+EXCEL_FILE = "tableau_metadata3.xlsx"
 
-# 🔹 Get Access Token for Power BI API
 def get_access_token():
-    url = f"{AUTHORITY}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default"
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    response = requests.post(url, data=data, headers=headers)
-    token = response.json().get("access_token")
-    if not token:
-        raise Exception(f"❌ Failed to get access token: {response.text}")
-    return token
+    """Authenticate and get an access token for Fabric API"""
+    app = msal.ConfidentialClientApplication(CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
+    result = app.acquire_token_for_client(scopes=SCOPE)
 
-# 🔹 Get Dataset ID Dynamically
-def get_dataset_id():
-    token = get_access_token()
-    url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        datasets = response.json().get("value", [])
-        for dataset in datasets:
-            if dataset["name"] == DATASET_NAME:
-                return dataset["id"]
-    return None  # Dataset does not exist
+    print("🔹 Full Token Response:", json.dumps(result, indent=2))  # Debugging
 
-# 🔹 Create Dataset if it Doesn't Exist
+    if "access_token" in result:
+        return result["access_token"]
+    else:
+        raise Exception("❌ Authentication failed: " + json.dumps(result, indent=2))
+
+def read_excel_metadata():
+    """Read Tableau metadata including visuals from the Excel file"""
+    try:
+        df = pd.read_excel(EXCEL_FILE)
+    except FileNotFoundError:
+        raise Exception(f"❌ Excel file '{EXCEL_FILE}' not found.")
+
+    # Check required columns
+    required_columns = {"Workbook Name", "Dashboard Name", "Dashboard ID", "Dashboard URL", "Visual Type", "Columns Used"}
+    if not required_columns.issubset(df.columns):
+        raise Exception(f"❌ Missing required columns in '{EXCEL_FILE}'. Expected: {required_columns}")
+
+    # Convert to Fabric format
+    columns = [
+        {"name": "Workbook Name", "dataType": "String"},
+        {"name": "Dashboard Name", "dataType": "String"},
+        {"name": "Dashboard ID", "dataType": "String"},
+        {"name": "Dashboard URL", "dataType": "String"},
+        {"name": "Visual Type", "dataType": "String"},
+        {"name": "Columns Used", "dataType": "String"}
+    ]
+
+    # Convert rows into Fabric table format
+    rows = df.to_dict(orient="records")  
+
+    return columns, rows
+
 def create_dataset():
+    """Create a Fabric dataset using extracted metadata"""
     token = get_access_token()
-    url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets"
+    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
 
+    columns, _ = read_excel_metadata()
+
     dataset_payload = {
-        "name": DATASET_NAME,
-        "defaultMode": "Push",
+        "name": "Tableau_Metadata_Dataset",
         "tables": [
             {
-                "name": "TableauData",
-                "columns": [
-                    {"name": "WorkbookName", "dataType": "String"},
-                    {"name": "DashboardName", "dataType": "String"},
-                    {"name": "DashboardID", "dataType": "String"},
-                    {"name": "DashboardURL", "dataType": "String"},
-                    {"name": "VisualType", "dataType": "String"},
-                    {"name": "ColumnsUsed", "dataType": "String"}
-                ]
+                "name": "TableauDashboards",
+                "columns": columns
             }
         ]
     }
 
     response = requests.post(url, headers=headers, json=dataset_payload)
 
+    print(f"🔍 API Response: {response.status_code}")
+    print("🔍 Full API Response:", response.json())  # Debugging
+
     if response.status_code == 201:
-        print(f"✅ Dataset '{DATASET_NAME}' created successfully.")
-        return get_dataset_id()
+        dataset_id = response.json()["id"]
+        print(f"✅ Dataset created successfully: {dataset_id}")
+        return dataset_id
     else:
-        print(f"❌ Failed to create dataset. Response Code: {response.status_code}")
-        print(f"❌ Response Text: {response.text}")  # Debugging Output
-        raise Exception("Dataset creation failed")
+        print(f"❌ Failed to create dataset: {response.text}")
+        return None
 
-# 🔹 Upload Data to Dataset
-def upload_data_to_power_bi():
-    df = pd.read_excel(EXCEL_FILE)
-
-    dataset_id = get_dataset_id() or create_dataset()  # Get dataset ID (or create it)
-    url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets/{dataset_id}/tables/TableauData/rows"
-    
+def add_data_to_dataset(dataset_id):
+    """Insert Tableau metadata rows into the Fabric dataset"""
+    token = get_access_token()
+    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets/{dataset_id}/tables/TableauDashboards/rows"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {get_access_token()}"
+        "Authorization": f"Bearer {token}"
     }
 
-    rows = df.to_dict(orient="records")
+    _, rows = read_excel_metadata()
     payload = {"rows": rows}
 
     response = requests.post(url, headers=headers, json=payload)
-    if response.status_code == 200:
-        print("✅ Data successfully uploaded to Power BI Dataset.")
-    else:
-        print(f"❌ Failed to upload data: {response.text}")
+    
+    print(f"🔍 API Response: {response.status_code}")
+    print("🔍 Full API Response:", response.json())  # Debugging
 
-# 🔹 Run the migration
+    if response.status_code == 200:
+        print("✅ Data added to dataset successfully.")
+    else:
+        print(f"❌ Failed to insert data: {response.text}")
+
+def create_report(dataset_id):
+    """Create a Fabric report in the workspace"""
+    token = get_access_token()
+    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/reports"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    report_payload = {
+        "name": "Tableau_Migrated_Report",
+        "datasetId": dataset_id
+    }
+
+    response = requests.post(url, headers=headers, json=report_payload)
+    
+    print(f"🔍 API Response: {response.status_code}")
+    print("🔍 Full API Response:", response.json())  # Debugging
+
+    if response.status_code == 201:
+        report_id = response.json()["id"]
+        print(f"✅ Report created successfully: {report_id}")
+        return report_id
+    else:
+        print("❌ Failed to create report:", response.text)
+        return None
+
+def add_visuals(report_id):
+    """Add visuals dynamically to the Fabric report based on Tableau metadata"""
+    token = get_access_token()
+    url = f"https://api.fabric.microsoft.com/v1.0/myorg/reports/{report_id}/pages/default/visuals"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    _, visuals = read_excel_metadata()
+
+    for visual in visuals:
+        visual_payload = {
+            "visualType": visual["Visual Type"],
+            "size": {"width": 400, "height": 300},
+            "position": {"x": 50, "y": 50},
+            "title": visual["Dashboard Name"],
+            "columns": visual["Columns Used"].split(", ")  # Convert comma-separated columns into list
+        }
+
+        response = requests.post(url, headers=headers, json=visual_payload)
+        
+        print(f"🔍 API Response: {response.status_code}")
+        print("🔍 Full API Response:", response.json())  # Debugging
+
+        if response.status_code == 201:
+            print(f"✅ Added {visual['Visual Type']} visual for {visual['Dashboard Name']}.")
+        else:
+            print(f"❌ Failed to add visual: {response.text}")
+
 if __name__ == "__main__":
-    print("🚀 Starting Tableau to Power BI (Fabric) Migration...")
-    upload_data_to_power_bi()
-    print("🎉 Migration completed! Check your Power BI dataset.")
+    print("🚀 Starting Tableau to Fabric Migration...")
+
+    dataset_id = create_dataset()
+    if dataset_id:
+        time.sleep(5)  # Wait for dataset to be created
+        add_data_to_dataset(dataset_id)
+        
+        report_id = create_report(dataset_id)
+        if report_id:
+            time.sleep(5)  # Wait for report to be created
+            add_visuals(report_id)
+
+    print("🎉 Migration completed! Check your Fabric workspace.")
+
