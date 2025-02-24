@@ -1,9 +1,12 @@
-import msal
+from msal import PublicClientApplication
 import requests
 import json
-import pandas as pd
 import time
 import sys
+import base64
+import os
+import re
+import time
 sys.path.append(r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project")
 import config
 
@@ -11,176 +14,219 @@ import config
 CLIENT_ID = config.client_id
 CLIENT_SECRET = config.client_secret
 TENANT_ID = config.tenant_id
-WORKSPACE_ID = 
+WORKSPACE_ID = config.workspace_id
+AUTHORITY = "https://login.microsoftonline.com/common"
+FABRIC_SCOPE = ["https://api.fabric.microsoft.com/.default"]
+SHAREPOINT_SCOPE = ["https://arjunnarendra1gmail.sharepoint.com/.default"]
+EXCEL_FILE = "tableau_metadata.xlsx"
 
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPE = ["https://api.fabric.microsoft.com/.default"]
-EXCEL_FILE = "tableau_metadata3.xlsx"
-
-def get_access_token():
+def get_fabric_access_token():
     """Authenticate and get an access token for Fabric API"""
-    app = msal.ConfidentialClientApplication(CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
-    result = app.acquire_token_for_client(scopes=SCOPE)
+    app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+    result = app.acquire_token_interactive(scopes=FABRIC_SCOPE)
+    return result["access_token"]
 
-    print("🔹 Full Token Response:", json.dumps(result, indent=2))  # Debugging
+def get_sharepoint_access_token():
+    """Authenticate and get an access token for SharePoint API"""
+    app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+    result = app.acquire_token_interactive(scopes=SHAREPOINT_SCOPE)
+    return result["access_token"]
 
-    if "access_token" in result:
-        return result["access_token"]
-    else:
-        raise Exception("❌ Authentication failed: " + json.dumps(result, indent=2))
+def encode_to_base_64(path):
+     with open(path, 'rb') as binary_file:
+        binary_file_data = binary_file.read()
+        base64_encoded_data = base64.b64encode(binary_file_data)
+        base64_output = base64_encoded_data.decode('utf-8')
+        return base64_output
+     
+def switch_to_connection_reference(path, semantic_model_id, semantic_model_name, workspace_name):
+    with open(path, 'r+') as file:
+        content = file.read()
+        file.truncate(0)
+        json_data = json.loads(content)
+        json_data["datasetReference"]["byPath"] = None
+        json_data["datasetReference"]["byConnection"] = {
+        "connectionString": f"Data Source=powerbi://api.powerbi.com/v1.0/myorg/{workspace_name};Initial Catalog={semantic_model_name};Integrated Security=ClaimsToken",
+        "pbiServiceModelId": None,
+        "pbiModelVirtualServerName": "sobe_wowvirtualserver",
+        "pbiModelDatabaseName": f"{semantic_model_id}",
+        "connectionType": "pbiServiceXmlaStyleLive",
+        "name": "EntityDataSource"
+        }
+        file.seek(0)
+        file.write(json.dumps(json_data))
 
-def read_excel_metadata():
-    """Read Tableau metadata including visuals from the Excel file"""
-    try:
-        df = pd.read_excel(EXCEL_FILE)
-    except FileNotFoundError:
-        raise Exception(f"❌ Excel file '{EXCEL_FILE}' not found.")
+def append_all_files(parts, pattern, base_dir=".", dataset_id=None, dataset_name=None, workspace_name=None):
+    """
+    Appends the relative path of every file found under base_dir
+    to the list 'parts'. The paths are relative to base_dir and use
+    forward slashes as separators.
+    
+    :param parts: List to which file paths will be appended.
+    :param base_dir: Directory from which to start the search (default: current directory).
+    """
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            file_full_path = os.path.join(root, file)
+            relative_path = os.path.relpath(file_full_path, base_dir)
+            # Replace Windows backslashes with forward slashes
+            relative_path = relative_path.replace("\\", "/")
+            if pattern.search(relative_path):
+                if "definition.pbir" in relative_path:
+                    switch_to_connection_reference(relative_path, dataset_id, dataset_name, workspace_name=workspace_name)
+                parts.append({
+                "path": relative_path, 
+                "payload": encode_to_base_64(relative_path),
+                "payloadType": "InlineBase64"
+                })
 
-    # Check required columns
-    required_columns = {"Workbook Name", "Dashboard Name", "Dashboard ID", "Dashboard URL", "Visual Type", "Columns Used"}
-    if not required_columns.issubset(df.columns):
-        raise Exception(f"❌ Missing required columns in '{EXCEL_FILE}'. Expected: {required_columns}")
+def create_dataset_payload():
+    dataset_payload = {}
+    dataset_payload["displayName"] = "Netflix Data New 4"
+    dataset_payload["description"] = "Data on Netflix movies"
+    parts = []
+    regexp = re.compile(r"definition/|definition.pbism|diagramLayout.json|.platform")
+    append_all_files(parts, regexp)
+    dataset_payload["definition"] = {"parts": []}
+    dataset_payload["definition"]["parts"] = parts
+    return dataset_payload
 
-    # Convert to Fabric format
-    columns = [
-        {"name": "Workbook Name", "dataType": "String"},
-        {"name": "Dashboard Name", "dataType": "String"},
-        {"name": "Dashboard ID", "dataType": "String"},
-        {"name": "Dashboard URL", "dataType": "String"},
-        {"name": "Visual Type", "dataType": "String"},
-        {"name": "Columns Used", "dataType": "String"}
-    ]
+def create_report_payload(dataset_id, dataset_name, workspace_name):
+    report_payload = {}
+    report_payload["displayName"] = "Netflix Report New 4"
+    report_payload["description"] = "Report on Netflix movies"
+    parts = []
+    regexp = re.compile(r"CustomVisuals/|StaticResources/|definition.pbir|definition/|semanticModelDiagramLayout.json|mobileState.json")
+    append_all_files(parts, regexp, dataset_id=dataset_id, dataset_name=dataset_name, workspace_name=workspace_name)
+    report_payload["definition"] = {"parts": []}
+    report_payload["definition"]["parts"] = parts
+    return report_payload
 
-    # Convert rows into Fabric table format
-    rows = df.to_dict(orient="records")  
+def wait_for_resource_creation(post_url, post_headers, post_payload, poll_interval=2, max_attempts=10):
+    # Make the initial POST request
+    response = requests.post(url=post_url, headers=post_headers, json=post_payload)
+    
+    if response.status_code != 202:
+        raise Exception(f"Unexpected status code: {response.status_code}")
+    
+    # Extract the URL for polling from the Location header (or response body)
+    status_url = response.headers.get('Location')
+    if not status_url:
+        raise Exception("No Location header found in the 202 response.")
+    
+    # Poll the status URL until the resource is created
+    for attempt in range(max_attempts):
+        time.sleep(poll_interval)
+        status_response = requests.get(status_url, headers=post_headers)
+        if status_response.json()["status"] == "Succeeded":
+            model_id = requests.get(f"{status_url}/result", headers=post_headers)
+            return model_id.json()
+    raise Exception("Resource creation did not complete in time.")
 
-    return columns, rows
+def create_semantic_model(token):
+    """Create a Fabric semantic model"""
+    
+    url = f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE_ID}/semanticModels"
 
-def create_dataset():
-    """Create a Fabric dataset using extracted metadata"""
-    token = get_access_token()
-    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
 
-    columns, _ = read_excel_metadata()
+    semantic_model_folder = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Power BI\Sales Report Project\Sales.SemanticModel"
+    os.chdir(semantic_model_folder)
+    dataset_payload = create_dataset_payload()
+    response = wait_for_resource_creation(url, headers, dataset_payload)
+    return response
 
-    dataset_payload = {
-        "name": "Tableau_Metadata_Dataset",
-        "tables": [
-            {
-                "name": "TableauDashboards",
-                "columns": columns
-            }
-        ]
-    }
+def get_connection_id_for_semantic_model(token, semantic_model_id):
+    """List all connections that the user has permission for"""
 
-    response = requests.post(url, headers=headers, json=dataset_payload)
+    url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets/{semantic_model_id}/datasources"
 
-    print(f"🔍 API Response: {response.status_code}")
-    print("🔍 Full API Response:", response.json())  # Debugging
-
-    if response.status_code == 201:
-        dataset_id = response.json()["id"]
-        print(f"✅ Dataset created successfully: {dataset_id}")
-        return dataset_id
-    else:
-        print(f"❌ Failed to create dataset: {response.text}")
-        return None
-
-def add_data_to_dataset(dataset_id):
-    """Insert Tableau metadata rows into the Fabric dataset"""
-    token = get_access_token()
-    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/datasets/{dataset_id}/tables/TableauDashboards/rows"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
 
-    _, rows = read_excel_metadata()
-    payload = {"rows": rows}
+    connections = requests.get(url, headers=headers)
+    connection_info = connections.json()["value"][0]
+    return connection_info["datasourceId"], connection_info["gatewayId"]
+
+def update_connection(token, connection_id, gateway_id):
+    """Update the connection"""
+
+    url = f"https://api.powerbi.com/v1.0/myorg/gateways/{gateway_id}/datasources/{connection_id}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    token = get_sharepoint_access_token()
+
+    payload = {
+        "credentialDetails": {
+            "credentialType": "OAuth2",
+            "credentials": f"{{\"credentialData\":[{{\"name\":\"accessToken\", \"value\":\"{token}\"}}]}}",
+            "encryptedConnection": "Encrypted",
+            "encryptionAlgorithm": "None",
+            "privacyLevel": "Organizational"
+        }
+    }
+    requests.patch(url, headers=headers, json=payload)
+
+def get_workspace_name(token):
+    """Get the workspace name"""
+
+    url = f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE_ID}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    response = requests.get(url, headers=headers)
+    return response.json()["displayName"]
+
+def create_report(token, dataset_id, dataset_name, workspace_name):
+    """Create a Fabric report"""
+
+    url = f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE_ID}/reports"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    report_folder = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Power BI\Sales Report Project\Sales.Report"
+    os.chdir(report_folder)
+    report_payload = create_report_payload(dataset_id, dataset_name, workspace_name)
+    response = requests.post(url, headers=headers, json=report_payload)
+
+def refresh_data(semantic_model_id):
+    """Refresh data"""
+
+    url = f"https://api.powerbi.com/v1.0/myorg/datasets/{semantic_model_id}/refreshes"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    payload = {
+        "notifyOption": "NoNotification"
+    }
 
     response = requests.post(url, headers=headers, json=payload)
     
-    print(f"🔍 API Response: {response.status_code}")
-    print("🔍 Full API Response:", response.json())  # Debugging
-
-    if response.status_code == 200:
-        print("✅ Data added to dataset successfully.")
-    else:
-        print(f"❌ Failed to insert data: {response.text}")
-
-def create_report(dataset_id):
-    """Create a Fabric report in the workspace"""
-    token = get_access_token()
-    url = f"https://api.fabric.microsoft.com/v1.0/myorg/groups/{WORKSPACE_ID}/reports"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    report_payload = {
-        "name": "Tableau_Migrated_Report",
-        "datasetId": dataset_id
-    }
-
-    response = requests.post(url, headers=headers, json=report_payload)
-    
-    print(f"🔍 API Response: {response.status_code}")
-    print("🔍 Full API Response:", response.json())  # Debugging
-
-    if response.status_code == 201:
-        report_id = response.json()["id"]
-        print(f"✅ Report created successfully: {report_id}")
-        return report_id
-    else:
-        print("❌ Failed to create report:", response.text)
-        return None
-
-def add_visuals(report_id):
-    """Add visuals dynamically to the Fabric report based on Tableau metadata"""
-    token = get_access_token()
-    url = f"https://api.fabric.microsoft.com/v1.0/myorg/reports/{report_id}/pages/default/visuals"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    _, visuals = read_excel_metadata()
-
-    for visual in visuals:
-        visual_payload = {
-            "visualType": visual["Visual Type"],
-            "size": {"width": 400, "height": 300},
-            "position": {"x": 50, "y": 50},
-            "title": visual["Dashboard Name"],
-            "columns": visual["Columns Used"].split(", ")  # Convert comma-separated columns into list
-        }
-
-        response = requests.post(url, headers=headers, json=visual_payload)
-        
-        print(f"🔍 API Response: {response.status_code}")
-        print("🔍 Full API Response:", response.json())  # Debugging
-
-        if response.status_code == 201:
-            print(f"✅ Added {visual['Visual Type']} visual for {visual['Dashboard Name']}.")
-        else:
-            print(f"❌ Failed to add visual: {response.text}")
-
 if __name__ == "__main__":
-    print("🚀 Starting Tableau to Fabric Migration...")
-
-    dataset_id = create_dataset()
-    if dataset_id:
-        time.sleep(5)  # Wait for dataset to be created
-        add_data_to_dataset(dataset_id)
-        
-        report_id = create_report(dataset_id)
-        if report_id:
-            time.sleep(5)  # Wait for report to be created
-            add_visuals(report_id)
-
-    print("🎉 Migration completed! Check your Fabric workspace.")
-
+    token = get_fabric_access_token()
+    semantic_model_info = create_semantic_model(token)
+    semantic_model_id = semantic_model_info["id"]
+    semantic_model_name = semantic_model_info["displayName"]
+    connection_id, gateway_id = get_connection_id_for_semantic_model(token, semantic_model_id)
+    connection_info = update_connection(token, connection_id, gateway_id)
+    workspace_name = get_workspace_name(token)
+    create_report(token, semantic_model_id, semantic_model_name, workspace_name)
+    refresh_data(semantic_model_id)
