@@ -7,8 +7,7 @@ import base64
 import os
 import re
 import time
-sys.path.append(r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project")
-import config
+from . import config
 
 # 🔹 Microsoft Fabric Credentials
 CLIENT_ID = config.client_id
@@ -119,8 +118,8 @@ def wait_for_resource_creation(post_url, post_headers, post_payload, poll_interv
         time.sleep(poll_interval)
         status_response = requests.get(status_url, headers=post_headers)
         if status_response.json()["status"] == "Succeeded":
-            model_id = requests.get(f"{status_url}/result", headers=post_headers)
-            return model_id.json()
+            response = requests.get(f"{status_url}/result", headers=post_headers)
+            return response.json()
     raise Exception("Resource creation did not complete in time.")
 
 def create_semantic_model(token):
@@ -202,7 +201,7 @@ def create_report(token, dataset_id, dataset_name, workspace_name):
     report_folder = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Power BI\Sales Report Project\Sales.Report"
     os.chdir(report_folder)
     report_payload = create_report_payload(dataset_id, dataset_name, workspace_name)
-    response = requests.post(url, headers=headers, json=report_payload)
+    requests.post(url, headers=headers, json=report_payload)
 
 def refresh_data(semantic_model_id):
     """Refresh data"""

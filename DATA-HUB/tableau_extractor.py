@@ -1,10 +1,10 @@
 import xml.etree.ElementTree as ET
 import pandas as pd
-
+import re
 
 # 🔹 Extract and Save Metadata
 def extract_datasource_metadata():
-    workbook_path = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Workbooks\Superstore.twb"
+    workbook_path = r"C:\Users\arjun\Quadrant\Tableau to Power BI Project\Repos\QHub\DATA-HUB\Tableau\World Indicators.twb"
     tree = ET.parse(workbook_path)
     root = tree.getroot()
     datasources = []
@@ -16,6 +16,7 @@ def extract_datasource_metadata():
             connection_type = connection_details.get("class")
             file_path = None
             tables = None
+            # The data source is a CSV file
             if connection_type == "textscan":
                 file_path = fr"{connection_details.get("directory")}/{connection_details.get("filename")}"
                 tables = connection.findall("relation")
@@ -33,6 +34,7 @@ def extract_datasource_metadata():
                         "Data Table Name": tableName,
                         "Column Names": columnNames
                     })
+            # The data source is an Excel file
             elif connection_type == "excel-direct":
                 file_path = fr"{connection_details.get("directory")}/{connection_details.get("filename")}"
                 tables = connection.findall("relation")
@@ -52,6 +54,7 @@ def extract_datasource_metadata():
                         "Data Table Name": tableName,
                         "Column Names": columnNames
                     })
+            # The data source is a hyper file
             elif connection_type == "hyper":
                 file_path = connection_details.get("dbname")
                 tables = connection.findall("relation")
@@ -73,10 +76,10 @@ def extract_datasource_metadata():
                         "Data Table Name": tableName,
                         "Column Names": columnNames
                     })
-    return datasources
+    return datasources, table_to_columns
 
 def extract_parameter_metadata():
-    workbook_path = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Workbooks\World Indicators.twb"
+    workbook_path = r"C:\Users\arjun\Quadrant\Tableau to Power BI Project\Repos\QHub\DATA-HUB\Tableau\World Indicators.twb"
     tree = ET.parse(workbook_path)
     root = tree.getroot()
     parameters = []
@@ -112,11 +115,10 @@ def extract_parameter_metadata():
 
 def get_mapping():
     column_to_table_mapping = {}
-    workbook_path = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Workbooks\Superstore.twb"
+    workbook_path = r"C:\Users\arjun\Quadrant\Tableau to Power BI Project\Repos\QHub\DATA-HUB\Tableau\World Indicators.twb"
     tree = ET.parse(workbook_path)
     root = tree.getroot()
     datasources = root.findall("./datasources/datasource")
-    print(datasources)
     for datasource in datasources:
         for map in datasource.findall("connection/cols/map"):
             column = map.get("key")
@@ -125,37 +127,39 @@ def get_mapping():
     return column_to_table_mapping
 
 def extract_visualization_metadata():
-    workbook_path = r"C:\Users\arjun\Quadrant\tableau_to_power_bi_project\Repos\QHub\DATA-HUB\Workbooks\World Indicators.twb"
+    workbook_path = r"C:\Users\arjun\Quadrant\Tableau to Power BI Project\Repos\QHub\DATA-HUB\Tableau\World Indicators.twb"
     tree = ET.parse(workbook_path)
     root = tree.getroot()
     visualizations = []
-    for visualization in root.findall(".//worksheets/worksheet"):
+    for worksheet in root.findall(".//worksheets/worksheet"):
+        worksheet_name = worksheet.get("name")
         # the default
-        visualization_title_text = "No title"
-        visualization_title_element = visualization.find(".//title")
-        if visualization_title_element is not None:
-            visualization_title_text = ""
-            for run in visualization_title_element.findall(".//run"):
-                visualization_title_text = visualization_title_text + run.text
-        
+        viz_title = "No title"
+        viz_title_element = worksheet.find(".//title")
+        if viz_title_element is not None:
+            viz_title = ""
+            for run in viz_title_element.findall(".//run"):
+                viz_title = viz_title + run.text
+
         mark_types = []
-        for pane in visualization.findall(".//panes/pane"):
+        for pane in worksheet.findall(".//panes/pane"):
             mark_types.append(pane.find("mark").get("class"))
         mark_types = ", ".join(mark_types)
 
-        datasources = []
-        for datasource in visualization.findall(".//datasources/datasource"):
-            datasource_name = datasource.get("name")
-            datasource_caption = "None"
-            if datasource_name != "Parameters":
-                datasource_caption = datasource.get("caption")
-
-            # for datasource_info in visualization.findall(f".//datasource-dependencies[@name='{datasource_name}']"):
-                
+        column_content = worksheet.find(".//cols").text
+        row_content = worksheet.find(".//rows").text
+        reg_ex = r"\]\.\[(.*?)\]"
+        columns = "None" if column_content is None else re.findall(reg_ex, column_content)
+        rows = "None" if row_content is None else re.findall(reg_ex, row_content)
 
         visualizations.append({
-            "Visualization Title": visualization_title_text,
-            "Mark Types": mark_types
+            "Worksheet Name": worksheet_name,
+            "Visualization Title": viz_title,
+            "Mark Types": mark_types,
+            "Column Shelf": columns,
+            "Row Shelf": rows,
+            "Filters": [],
+            "Measure Values": []
         })
     return visualizations
 
@@ -172,27 +176,25 @@ def adjust_column_widths(dataframe, worksheet):
 if __name__ == "__main__":
 
     mapping = get_mapping()
-    print(mapping)
-    exit()
 
-    datasources = extract_datasource_metadata()
-    df_datasources = pd.DataFrame(datasources)
+    # datasources = extract_datasource_metadata()
+    # df_datasources = pd.DataFrame(datasources)
 
     # parameters = extract_parameter_metadata()
     # df_parameters = pd.DataFrame(parameters)
 
-    # visualizations = extract_visualization_metadata()
-    # df_visualizations = pd.DataFrame(visualizations)
+    visualizations = extract_visualization_metadata()
+    df_visualizations = pd.DataFrame(visualizations)
 
-    with pd.ExcelWriter("superstore_workbook_datasource_metadata.xlsx") as writer:
-        df_datasources.to_excel(writer, sheet_name="Datasources", index=False)
-        worksheet = writer.sheets["Datasources"]
-        adjust_column_widths(df_datasources, worksheet)
+    with pd.ExcelWriter("workbook_metadata.xlsx") as writer:
+        # df_datasources.to_excel(writer, sheet_name="Datasources", index=False)
+        # worksheet = writer.sheets["Datasources"]
+        # adjust_column_widths(df_datasources, worksheet)
 
-    #     df_parameters.to_excel(writer, sheet_name="Parameters", index=False)
-    #     worksheet = writer.sheets["Parameters"]
-    #     adjust_column_widths(df_parameters, worksheet)
+        # df_parameters.to_excel(writer, sheet_name="Parameters", index=False)
+        # worksheet = writer.sheets["Parameters"]
+        # adjust_column_widths(df_parameters, worksheet)
 
-        # df_visualizations.to_excel(writer, sheet_name="Visualizations", index=False)
-        # worksheet = writer.sheets["Visualizations"]
-        # adjust_column_widths(df_visualizations, worksheet)
+        df_visualizations.to_excel(writer, sheet_name="Visualizations", index=False)
+        worksheet = writer.sheets["Visualizations"]
+        adjust_column_widths(df_visualizations, worksheet)
